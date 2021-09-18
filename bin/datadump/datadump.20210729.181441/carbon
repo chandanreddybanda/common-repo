@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+
+# dates = YYYYMMDD, PYYYYMMDDN DONE
+# vectors = "@"
+# time = XXsecs, XXmillis // XXms, XXmins
+# time_stamp = 150000000
+# decimals = XXX%, XXXbps, XXcr, XXlacs, XX
+
+# env
+# include
+
+import sys
+import setproctitle
+setproctitle.setproctitle(' '.join(sys.argv))
+
+from io import StringIO
+import re
+import os
+import sys
+import pdb
+import datetime
+import signal
+import hft
+import pandas
+import pytz
+import collections
+import bisect
+
+from string import Template
+
+from configobj import *
+
+# handle getting killed
+signal.signal(signal.SIGTERM, lambda signum, stack_frame: sys.exit(1))
+
+filename=sys.argv[1]
+today=sys.argv[2]
+
+
+def replace_vars(value):
+    ans=value
+    for key in sorted(env.keys()):
+        if (ans.rfind("$"+key)>=0):
+            ans=ans.replace("$"+key,env[key])
+    return(ans)
+
+dimension_dict = {
+    'bp': 0.0001,
+    'bps': 0.0001,
+    '%': 0.01,
+    '': 1,
+    'k': 1e3,
+    'K': 1e3,
+    'lac': 1e5,
+    'lacs': 1e5,
+    'lakh': 1e5,
+    'lakhs': 1e5,
+    'm': 1e6,
+    'M': 1e6,
+    'cr': 1e7,
+    'crs': 1e7,
+    'b': 1e9,
+    'B': 1e9,
+    'ms': datetime.timedelta(milliseconds=1),
+    'milli': datetime.timedelta(milliseconds=1),
+    'millis': datetime.timedelta(milliseconds=1),
+    'sec': datetime.timedelta(seconds=1),
+    'secs': datetime.timedelta(seconds=1),
+    'min': datetime.timedelta(minutes=1),
+    'mins': datetime.timedelta(minutes=1),
+    'hour': datetime.timedelta(hours=1),
+    'hours': datetime.timedelta(hours=1),
+}
+
+def get_n_day(dates,n):
+    today_index=dates.index(today)
+    a=dates[today_index+n]
+    return(a)
+
+def parse_vector(path):
+    path=path.replace('@','')
+    v=open(evaluate(path))
+    v=v.readlines()
+    v=v[0]
+    v=v.replace(']\n','')
+    v=v.replace(']','')
+    v=v.replace('[','')
+    v=v.split(',')
+    return v
+
+def evaluate(value):
+    value=replace_vars(value)
+
+    if value.startswith('"') and value.endswith('"'):
+        str_val = value.replace('"','')
+        return str_val
+
+    if(value.lower()=="inf"):
+        return float("inf")
+
+    elif((value.lower()=='true') or (value.lower()=='t')):
+        return True
+
+    elif((value.lower()=='false') or (value.lower()=='f')):
+        return False
+
+    elif value.startswith('@'):
+        vec = parse_vector(value)
+        vec1 = [ evaluate(x) for x in vec ]
+        return vec1
+
+    elif value.startswith('!'):
+        path=value.replace('!','')
+        df = pandas.read_csv(evaluate(path))
+        return df
+
+    elif(value.rfind('PYYYYMMDD')>=0):
+        loc=value.rfind("PYYYYMMDD")
+        n=int(value[loc+9])
+        date=get_n_day(dates,-n)
+        return evaluate(value[0:loc]+date+value[loc+10:len(value)])
+
+    elif(value.rfind('YYYYMMDD')>=0):
+        return re.sub("YYYYMMDD",today,value)
+
+    elif(value.rfind(":")>=0):
+        time = tz.localize(datetime.datetime.strptime(today+" "+value,"%Y%m%d %H:%M:%S"))
+        return time
+
+    m = re.match(r"(-?\d*[.]\d+)\s*([^\d\s]*)", value)
+    if m is not None:
+        m=m.groups()
+        a=m[0]
+        b=m[1]
+        if b in dimension_dict:
+            return float(a)*dimension_dict[b]
+
+    m = re.match(r"(-?\d+)\s*([^\d\s]*)", value)
+    if m is not None:
+        m=m.groups()
+        a=m[0]
+        b=m[1]
+        if b in dimension_dict:
+            return int(a)*dimension_dict[b]
+
+    return value
+
+def lvalue_transform(section, key):
+    val = section[key]
+    if isinstance(val, (dict)):
+        pass
+    elif isinstance(val, (tuple, list)):
+        section[key] = [ evaluate(x) for x in val ]
+    else:
+        section[key] = evaluate(val)
+
+f=open(filename)
+lines=f.readlines()
+
+config = ConfigObj(filename)
+env=dict(config['env'])
+env.setdefault('WD', '.')
+env.setdefault('YYYYMMDD', today)
+env.update(os.environ)
+
+tz = pytz.timezone(config['trading']['timezone'])
+dates=parse_vector(config['trading']['dates'])
+edates=parse_vector(config['trading']['expiry_dates'])
+expiry=[ x for x in edates if int(x) >= int(today) ][0]
+days_to_expiry=dates.index(expiry)-bisect.bisect_left(dates, today)
+
+config.walk(lvalue_transform, call_on_sections=True)
+
+rms_users={}
+
+if config['trading'].get('rms_users') is not None:
+    rms_users_file = config['trading']['rms_users']
+    for rms_file in sorted(rms_users_file):
+        rms_user_file = '/home/' + rms_file
+        rms_user = ConfigObj(rms_user_file)
+        rms_user.walk(lvalue_transform, call_on_sections=True)
+        rms_users[rms_user_file]=rms_user
+        print("read rms file with path ",rms_user_file, flush=True)
+
+# if rms_crim is None:
+#     raise NameError('rms_crim file not found')
+
+producer_end_time = tz.localize(datetime.datetime.strptime(today,'%Y%m%d')) #set the special default value same as reference time
+if(config['trading'].get('end_time') is not None):
+    producer_end_time = config['trading']['end_time']
+
+hft.base.init(
+    log_prefix=env['WD']+'/'+today+'.',
+    realtime=config['trading']['realtime'],
+    recovery_prefix='' if 'RD' not in env else (env['RD']+'/'+today+'.'),
+    datetime_ref=tz.localize(datetime.datetime.strptime(today,'%Y%m%d')),
+    end_time=producer_end_time
+    )
+
+hft.mantle.open_contracts_log("contracts")
+
+unit_dict={}
+unit_type={}
+unit_args={}
+def add_unit(unit,key,args=None,type_='crust.adapter'):
+    if(key in unit_dict.keys()):
+        print("Already have a unit named",key, flush=True)
+        exit
+    else:
+        unit_dict[key]=unit
+        unit_type[key]=type_
+        unit_args[key]=args
+
+insts=pandas.DataFrame()
+
+if config.get("contracts") is not None:
+    #pdb.set_trace()
+    sectors=pandas.DataFrame()
+    on_positions = pandas.DataFrame()
+    exchange_mantle_mode = pandas.DataFrame()
+    mantle_mode = pandas.DataFrame()
+
+    if(config['contracts'].get('sectors') is not None):
+        sectors=pandas.read_csv(config['contracts']['sectors']).drop_duplicates()
+
+    if(config['contracts'].get('overnight_positions') is not None):
+        on_positions=pandas.read_csv(config['contracts']['overnight_positions'])
+
+    if(config['contracts'].get('exchange_mantle_mode') is not None):
+        exchange_mantle_mode=pandas.read_csv(config['contracts']['exchange_mantle_mode'])
+        #,skiprows=1, names=['secban','u_name'])
+
+    if(config['contracts'].get('mantle_mode') is not None):
+        mantle_mode=pandas.read_csv(config['contracts']['mantle_mode'])
+        #,skiprows=1, names=['secban','u_name'])
+
+    for section in sorted(config['contracts'].keys()):
+        tmode=mantle_mode
+
+        if not section.startswith('section'):
+            continue
+
+        df = pandas.read_csv(config['contracts'][section]['file'], dtype={'extra_data': object})
+        d=df
+
+        if config["contracts"][section].get("underlyings") is not None:
+            u = config['contracts'][section]['underlyings']
+        else:
+            u = df.u_name
+            u = u.unique()
+
+        if isinstance(u,str):
+            u=[u]
+
+        if config["contracts"][section].get('type') is not None:
+            if(('OPTION_CE' in config['contracts'][section]['type']) or ('OPTION_PE' in config['contracts'][section]['type'])):
+                fo1 = d[['u_name','expiryseq','plast','type']]
+                fo1 = fo1[fo1['type']=='FUTURE']
+                fo1 = fo1[fo1['expiryseq']==1]
+                fo1['u_plast'] = fo1['plast']
+                fo1 = fo1[['u_name','u_plast']]
+
+                d = pandas.merge(d,fo1,how="left")
+                fut=d[d['type']=='FUTURE']
+                options=d[(df['type']=='OPTION_PE') | (df['type']=='OPTION_CE')]
+                options=options[options['strike_price'] > (1-config['contracts'][section]['strike_cutoff'])*options['u_plast']]
+                options=options[options['strike_price'] < (1+config['contracts'][section]['strike_cutoff'])*options['u_plast']]
+                if config["contracts"][section].get('strike_mod'):
+                    options=options[options['strike_price']%config["contracts"][section].get('strike_mod')==0]
+                del options['u_plast']
+                df=options
+
+        if config["contracts"][section].get("underlyings") is not None:
+            if(isinstance(config['contracts'][section]['underlyings'],collections.Iterable)):
+                df = df[df.u_name.isin(u)]
+            else:
+                df = df[df['u_name'] == u]
+
+        if config["contracts"][section].get("names") is not None:
+            if(isinstance(config['contracts'][section]['names'],collections.Iterable)):
+                names=config['contracts'][section]['names']
+                df = df[df.name.isin(names)]
+            else:
+                df = df[df['name'] == config['contracts'][section]['names']]
+
+        if config["contracts"][section].get("symbol_regex") is not None:
+            df = df[df.name.str.match(config["contracts"][section]["symbol_regex"], as_indexer=True)]
+
+        if config['contracts'][section].get('exchange') is not None:
+            df = df[df.exchange == config['contracts'][section]['exchange']]
+
+        if config['contracts'][section].get('tag') is not None:
+            df['tag'] = config['contracts'][section]['tag']
+        else:
+            df['tag'] = -1;
+
+        if config['contracts'][section].get('u_exchange') is not None:
+            df = df[df.u_exchange == config['contracts'][section]['u_exchange']]
+
+        try:
+            config['contracts'][section]['type'] = config['contracts'][section]['type'].split()
+        except:
+            print(flush=True)
+
+        if config['contracts'][section].get('type') is not None:
+            df = df[df.type.isin(config['contracts'][section]['type'])]
+
+        if config['contracts'][section].get('expiryseq') is not None:
+            if(isinstance(config['contracts'][section]['expiryseq'],collections.Iterable)):
+                df = df[df.expiryseq.isin(config['contracts'][section]['expiryseq'])]
+            else:
+                df = df[df['expiryseq'] == (config['contracts'][section]['expiryseq'])]
+
+        if config['contracts'][section].get('min_mddv') is not None:
+            df = df[df['mddv_20'] > config['contracts'][section]['min_mddv']]
+
+        if config['contracts'][section].get('min_price') is not None:
+            df = df[df['plast'] > config['contracts'][section]['min_price']]
+
+        if config['contracts'][section].get('min_pvolume') is not None:
+            df = df[df['pvolume'] > config['contracts'][section]['min_pvolume']]
+
+        if config['contracts'][section].get('min_pqty') is not None:
+            df = df[df['pqty'] > config['contracts'][section]['min_pqty']]
+
+        if not "poi" in df.columns:
+            df['poi'] = float("nan")
+
+        if(len(sectors)>0):
+            df = pandas.merge(df,sectors,how="left",)
+            df['sector'].fillna(-1, inplace=True)
+        else:
+            df['sector']     = 0
+
+        if config['contracts'][section].get('sector') is not None:
+            if(isinstance(config['contracts'][section]['sector'],collections.Iterable)):
+                df = df[df.sector.isin(config['contracts'][section]['sector'])]
+            else:
+                df = df[df['sector'] == (config['contracts'][section]['sector'])]
+
+
+        if(len(on_positions)>0):
+            df = pandas.merge(df,on_positions,how="left")
+            df['position'].fillna(0, inplace=True)
+        else:
+            df['position']     = 0
+
+        if(len(exchange_mantle_mode)>0):
+            df = pandas.merge(df,exchange_mantle_mode,how="left")
+            df['exchange_mantle_mode'].fillna("CONTINUOUS", inplace=True)
+        else:
+            df['exchange_mantle_mode']     = "CONTINUOUS"
+
+        if(len(tmode)>0):
+            tmode = tmode[tmode['sdate']<=int(today)]
+            tmode = tmode.drop('sdate', 1)
+        if(len(tmode)>0):
+            tmode = tmode[tmode['edate']>=int(today)]
+            tmode = tmode.drop('edate', 1)
+
+        if(len(tmode)>0):
+            df = pandas.merge(df,tmode,how="left")
+            df['mantle_mode'].fillna("CONTINUOUS", inplace=True)
+        else:
+            df['mantle_mode']     = "CONTINUOUS"
+
+        if not "ldpr" in df.columns:
+            df['ldpr'] = -float("inf")
+
+        if not "hdpr" in df.columns:
+            df['hdpr'] = float("inf")
+
+        if not "mwpl" in df.columns:
+            df['mwpl'] = float("inf")
+
+        if not "tmargin" in df.columns:
+            df['tmargin'] = 0
+
+        if not "freeze_qty" in df.columns:
+            df['freeze_qty'] = float("inf")
+
+        if not 'extra_data' in df.columns:
+            df['extra_data'] = ''
+
+        df['enabled'] = config['contracts'][section].get('enabled', False)
+
+        if config['contracts'][section].get('days_to_expiry') is not None:
+            if((not 'STOCK' in config['contracts'][section]['type']) and (days_to_expiry > config['contracts'][section]['days_to_expiry'])):
+                pass
+            else:
+                insts=insts.append(df,ignore_index=True)
+        else:
+            insts=insts.append(df,ignore_index=True)
+
+    #u_pname for options
+
+    stocks = insts[insts.type == 'STOCK'].name.tolist();
+    option_types = ['OPTION_CE', 'OPTION_PE', 'OPTION_CA', 'OPTION_PA']
+
+
+    def get_pricing_fut(row, field):
+        if ((row.type not in option_types)):
+            return row["u_"+field]
+        futs = insts[(insts.type == 'FUTURE') & (insts.u_name == row.u_name) & (insts.u_exchange == row.u_exchange)]
+
+        if (len(futs)) is 0:
+            if row.u_name in stocks:
+                return row["u_"+field]
+
+        def zip_expiryseq_symbol(r):
+            d = {}
+            d['expiryseq']= r.expiryseq
+            d['name']   = r["name"]
+            d['exchange'] = r.exchange
+            return d
+
+        fut_list = futs.apply(zip_expiryseq_symbol, axis =1).tolist()
+        if (len(fut_list) == 0):
+            print("ERROR: couldn't find undelying future for ", row["name"])
+        for fut in fut_list:
+            if fut['expiryseq'] == row.expiryseq:
+                #print(fut["name"], row["name"])
+                return fut[field]
+
+        if row.u_name in stocks:
+            return row["u_"+field]
+
+        from functools import reduce
+        return reduce(lambda x, y: x if x['expiryseq'] < y['expiryseq'] else y,  fut_list)[field]
+
+    insts['bool_is_option']   = insts.type.apply(lambda x: x in option_types)
+
+    insts['u_pname'] = insts.u_name
+    insts['u_pexchange'] = insts.u_exchange
+    insts.loc[insts.bool_is_option, 'u_pname'] = insts.apply(lambda x: get_pricing_fut(x, 'name'), axis=1)
+    insts.loc[insts.bool_is_option, 'u_pexchange'] = insts.apply(lambda x: get_pricing_fut(x, 'exchange'), axis=1)
+
+    insts.drop(['bool_is_option'], inplace = True, axis = 1)
+
+    #u_pname for options - END
+
+    insts['expiry'] = insts['expiry_date'].map(lambda x: tz.localize(datetime.datetime(1980,1,1)) + datetime.timedelta(seconds=int(x)))
+
+    hft.mantle.add_instruments(insts)
+
+# add_unit(hft.base.Unit('crust.adapter', 'MktDataSnapPass'),'mktdatasnappass')
+mktdata={}
+timers={}
+indicators={}
+
+if config.get("data") is not None:
+    for feed in sorted(config['data'].keys()):
+        producers=[]
+        consumers=[]
+        for i in sorted(config['data'][feed].keys()):
+            if i.startswith('listener'):
+                adapter_name=config['data'][feed][i]['type']+'.adapter'
+                kwargs = config['data'][feed][i]
+                producers.append(hft.base.Unit(adapter_name, 'StreamReader',**kwargs))
+                add_unit(unit=producers[-1],key=feed+'.producer.'+str(len(producers)),type_=adapter_name,args=kwargs)
+            elif i.startswith('parser'):
+                adapter_name=config['data'][feed][i]['type']+'.adapter'
+                kwargs = config['data'][feed][i]
+                consumers.append(hft.base.Unit(adapter_name, 'Parser',**kwargs))
+                add_unit(unit=consumers[-1],key=feed+'.consumer.'+str(len(consumers)),type_=adapter_name,args=kwargs)
+            elif i.startswith('indicator'):
+                adapter_name=config['data'][feed][i]['type']+'.indicator'
+                kwargs = config['data'][feed][i]
+                consumers.append(hft.base.Unit(adapter_name, 'Indicator',**kwargs))
+                add_unit(unit=consumers[-1],key=feed+'.consumer.'+str(len(consumers)),type_='indicator',args=kwargs)
+            elif i.startswith('recorder'):
+                adapter_name=config['data'][feed][i]['type']+'.adapter'
+                kwargs = config['data'][feed][i]
+                consumers.append(hft.base.Unit(adapter_name, 'StreamWriter',**kwargs))
+                add_unit(unit=consumers[-1],key=feed+'.consumer.'+str(len(consumers)),type_=adapter_name,args=kwargs)
+        mktdata[feed] = producers, consumers
+        for producer in producers:
+            for consumer in consumers:
+                hft.base.connect(producer.outputs['packet'], consumer.inputs['packet'])
+                #print("connecting producer", mkt, "consumer", mkt, flush=True)
+
+# touch loggers
+config['trading'].setdefault('log_touch', True)
+touch = hft.base.Unit('crust.adapter', 'Touch', log='touch' if config['trading']['log_touch'] else '')
+add_unit(unit=touch,key="touch")
+
+# trade loggers
+config['trading'].setdefault('log_trade', True)
+if config['trading']['log_trade']:
+    trade = hft.base.Unit('crust.adapter', 'Trade', log='trade')
+    add_unit(unit=trade,key="trade")
+
+if config.get("timers") is not None:
+    for i in sorted(config['timers'].keys()):
+        kwargs = config['timers'][i]
+        timers[i] = hft.base.Unit('crust.adapter', 'Timer', **kwargs)
+        add_unit(unit=timers[i],key=i,args=kwargs,type_='timer')
+
+
+if config.get("indicators") is not None:
+    for i in sorted(config['indicators'].keys()):
+        config['indicators'][i]['days_to_expiry']=days_to_expiry
+        kwargs = config['indicators'][i]
+        indicators[i] = hft.base.Unit(config['indicators'][i]['type'] + '.indicator', 'Indicator', **kwargs)
+        add_unit(unit=indicators[i],key=i,type_='indicator',args=kwargs)
+
+bridge=None
+if config.get("bridge") is not None:
+    kwargs = config['bridge']
+    risk_limits = kwargs['risk_limits']
+    kwargs["today"] = evaluate("00:00:00")
+    for rms_user in sorted(rms_users.keys()):
+        rms1 = rms_users[rms_user]
+        if rms1.get("bridge") is not None:
+            kwargs_user = rms1['bridge']
+            risk_limits_user = kwargs_user['risk_limits']
+            for key in sorted(risk_limits.keys()):
+                oldlimit = risk_limits[key]
+                if risk_limits_user.get(key) is not None:
+                    newlimit = min(risk_limits[key],risk_limits_user[key])
+                    if key=='min_price' :
+                        newlimit = max(risk_limits[key],risk_limits_user[key])
+                    if (oldlimit != newlimit):
+                        kwargs['risk_limits'][key] = newlimit
+                        print("changes made for", rms_user, flush=True)
+                        print("setting new risk_limit, key = ",key, ",oldlimit =", oldlimit, ",newlimit =",newlimit, flush=True)
+    bridge = hft.base.Unit('crust.adapter', 'Bridge', **kwargs)
+    add_unit(unit=bridge,key="bridge",args=kwargs)
+
+control=None
+if config.get("control") is not None:
+    control = config['control']
+elif config.get("control") is not None:
+    control = config['control']
+if control is not None:
+    kwargs = control
+    control = hft.base.Unit('control.adapter', 'Control', **kwargs)
+    add_unit(unit=control,key="control",args=kwargs)
+
+
+portfoliologger=None
+if config.get("portfoliologger") is not None:
+    kwargs = config['portfoliologger']
+    portfoliologger = hft.base.Unit('crust.adapter', 'PortfolioLogger',**kwargs)
+    add_unit(unit=portfoliologger,key="portfoliologger",args=kwargs)
+
+for i in sorted(config.keys()):
+    if i.startswith('executer'):
+        kwargs = config[i]
+        adapter_name=kwargs['type']+'.adapter'
+        executer = hft.base.Unit(adapter_name, 'Executer',**kwargs)
+        add_unit(unit=executer,key=i,args=kwargs)
+
+for i in sorted(config.keys()):
+    if i.startswith('strategy'):
+        kwargs = config[i]
+        kwargs['days_to_expiry']=days_to_expiry
+        strategy = hft.base.Unit(kwargs['type'] + '.strategy', 'Strategy',**kwargs)
+        add_unit(unit=strategy,key=i,args=kwargs,type_="indicator")
+
+liquidator=None
+if config.get("liquidator") is not None:
+    kwargs = config['liquidator']
+    liquidator = hft.base.Unit(kwargs['type'] + '.strategy', 'Strategy',**kwargs)
+    add_unit(unit=liquidator,key="liquidator",args=kwargs,type_="indicator")
+
+adapters=None
+if config.get("adapters") is not None:
+    for adapter in sorted(config["adapters"].keys()):
+        kwargs = config['adapters'][adapter]
+        p = hft.base.Unit(**kwargs)
+        add_unit(unit=p,key=adapter,args=kwargs,type_="indicator")
+
+archives={}
+if config.get("archives") is not None:
+    for i in sorted(config['archives'].keys()):
+        kwargs = dict(config['archives'][i])
+        off = kwargs['offsets']
+        off_dict = {}
+        offset_functions = kwargs.get('offset_functions', ['touch'])
+        for time in sorted(off):
+            off_dict[time]=offset_functions
+        off_dict[datetime.timedelta(0)]=kwargs['functions']
+        kwargs['offsets']=off_dict
+        try:
+            eve = kwargs['n_events']
+        except KeyError:
+            eve = None;
+        if eve:
+            eve_dict = {}
+            event_functions = kwargs.get('event_functions', ['touch'])
+            for event in sorted(eve):
+                if event <= 0:
+                    raise ValueError('every element in n_events should be > 0, invalid value provided: ' + str(event))
+                eve_dict[event]=event_functions
+            kwargs['n_events']=eve_dict
+
+        archives[i] = hft.base.Unit('crust.adapter', 'Archive',**kwargs)
+        add_unit(unit=archives[i],key=i,args=kwargs)
+order_send_consumers_ = {}
+def connect_units(input_name, unit1_,trigger_=0):
+    #print("searching for ..",input_name, flush=True)
+    input_channel=input_name
+    if(trigger_==1):
+        input_channel='trigger'
+    if(input_name=='packet'):
+        return(None)
+    for unit2 in sorted(unit_dict.keys()):
+        if((unit_type[unit2]=='indicator') or (unit_type[unit2]=='timer')):
+            if(input_name==unit2):
+                print("connecting", unit1_, unit2, flush=True)
+                if(unit_type[unit2]=='indicator'):
+                    hft.base.connect(unit_dict[unit2].outputs['indicator'], unit_dict[unit1_].inputs[input_channel])
+                else:
+                    hft.base.connect(unit_dict[unit2].outputs['output'], unit_dict[unit1_].inputs[input_channel])
+
+        for out in sorted(unit_dict[unit2].outputs.keys()):
+            if(input_name==out):
+                if (input_name == "order_send"):
+                    order_send_consumers_[unit1_] = [(unit2,out), (unit1_,input_channel)]
+                else:
+                    print("connecting output ", out, "from", unit2, "to",unit1, flush=True)
+                    hft.base.connect(unit_dict[unit2].outputs[out], unit_dict[unit1_].inputs[input_channel])
+
+def get_connection(input_name):
+#    print("searching for ..",input_name, flush=True)
+    if(input_name=='packet'):
+        return(None)
+    for unit2 in sorted(unit_dict.keys()):
+        if((unit_type[unit2]=='indicator') or (unit_type[unit2]=='timer')):
+            if(input_name==unit2):
+                # print("connecting", unit1_, unit2, flush=True)
+                if(unit_type[unit2]=='indicator'):
+                    return(unit_dict[unit2].outputs['indicator'])
+                else:
+                    return(unit_dict[unit2].outputs['output'])
+
+        for out in sorted(unit_dict[unit2].outputs.keys()):
+            if(input_name==out):
+#                print("connecting output ", out, "from", unit2, "to",unit1, flush=True)
+                return(unit_dict[unit2].outputs[out])
+
+for unit1 in sorted(unit_dict.keys(), key=lambda x: (1, x) if x == 'executer' else ((2, x) if x == 'latency' else (0, x))):
+    print(unit1, flush=True)
+    for inp in sorted(unit_dict[unit1].inputs.keys()):
+        if(inp=='trigger'):
+#            print(unit1, flush=True)
+            triggers=unit_args[unit1]['trigger']
+            if(isinstance(triggers, (tuple, list))):
+                for t in triggers:
+                    connect_units(t,unit1,trigger_=1)
+            else:
+                connect_units(triggers,unit1,trigger_=1)
+        else:
+            connect_units(inp,unit1)
+    print("----------------------------------------", flush=True)
+
+print("connecting order_send in correct order", flush=True)
+
+for unit1 in sorted(order_send_consumers_.keys(), key=lambda x: (1, x) if x.startswith('executer') else ((2, x) if x == 'latency' else (3, x))):
+    _output_unit, _output_channel = order_send_consumers_[unit1][0]
+    _input_unit, _input_channel = order_send_consumers_[unit1][1]
+    print("connecting output ", _output_channel, "from", _output_unit, "to",_input_unit, flush=True)
+    hft.base.connect(unit_dict[_output_unit].outputs[_output_channel], unit_dict[_input_unit].inputs[_input_channel])
+
+#print("done", flush=True)
+hft.base.prepare()
+hft.mantle.prepare()
+hft.mantle.close_contracts_log()
+hft.base.run(config['trading'].get('cpu_set'))
+hft.base.join(.1)
